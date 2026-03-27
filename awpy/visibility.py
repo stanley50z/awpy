@@ -12,6 +12,7 @@ from typing import Literal, overload
 
 import numpy as np
 from loguru import logger
+import numba
 
 import awpy.vector
 
@@ -651,6 +652,235 @@ def build_flat_bvh(triangles: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.nd
     return nodes, children, tri_idx
 
 
+@numba.njit(cache=True)
+def _aabb_intersects_ray(
+    box_min_x: float, box_min_y: float, box_min_z: float,
+    box_max_x: float, box_max_y: float, box_max_z: float,
+    ox: float, oy: float, oz: float,
+    dx: float, dy: float, dz: float,
+) -> bool:
+    """Slab-method AABB-ray intersection test."""
+    eps = 1e-6
+    inv_dx = 1.0 / dx if abs(dx) > eps else 1e18 if dx >= 0 else -1e18
+    inv_dy = 1.0 / dy if abs(dy) > eps else 1e18 if dy >= 0 else -1e18
+    inv_dz = 1.0 / dz if abs(dz) > eps else 1e18 if dz >= 0 else -1e18
+
+    tx1 = (box_min_x - ox) * inv_dx
+    tx2 = (box_max_x - ox) * inv_dx
+    if tx1 > tx2:
+        tx1, tx2 = tx2, tx1
+
+    ty1 = (box_min_y - oy) * inv_dy
+    ty2 = (box_max_y - oy) * inv_dy
+    if ty1 > ty2:
+        ty1, ty2 = ty2, ty1
+
+    tz1 = (box_min_z - oz) * inv_dz
+    tz2 = (box_max_z - oz) * inv_dz
+    if tz1 > tz2:
+        tz1, tz2 = tz2, tz1
+
+    t_enter = max(tx1, ty1, tz1)
+    t_exit = min(tx2, ty2, tz2)
+    return t_enter <= t_exit and t_exit >= 0.0
+
+
+@numba.njit(cache=True)
+def _ray_tri_intersect(
+    ox: float, oy: float, oz: float,
+    dx: float, dy: float, dz: float,
+    p1x: float, p1y: float, p1z: float,
+    p2x: float, p2y: float, p2z: float,
+    p3x: float, p3y: float, p3z: float,
+    max_dist: float,
+) -> bool:
+    """Moller-Trumbore ray-triangle intersection. Returns True if hit within max_dist."""
+    eps = 1e-6
+    e1x = p2x - p1x; e1y = p2y - p1y; e1z = p2z - p1z
+    e2x = p3x - p1x; e2y = p3y - p1y; e2z = p3z - p1z
+
+    hx = dy * e2z - dz * e2y
+    hy = dz * e2x - dx * e2z
+    hz = dx * e2y - dy * e2x
+    a = e1x * hx + e1y * hy + e1z * hz
+    if -eps < a < eps:
+        return False
+
+    f = 1.0 / a
+    sx = ox - p1x; sy = oy - p1y; sz = oz - p1z
+    u = f * (sx * hx + sy * hy + sz * hz)
+    if u < 0.0 or u > 1.0:
+        return False
+
+    qx = sy * e1z - sz * e1y
+    qy = sz * e1x - sx * e1z
+    qz = sx * e1y - sy * e1x
+    v = f * (dx * qx + dy * qy + dz * qz)
+    if v < 0.0 or u + v > 1.0:
+        return False
+
+    t = f * (e2x * qx + e2y * qy + e2z * qz)
+    return t > eps and t <= max_dist
+
+
+@numba.njit(cache=True)
+def _traverse_flat_bvh(
+    nodes: np.ndarray,       # (M, 6) float64
+    children: np.ndarray,    # (M, 2) int32
+    tri_idx: np.ndarray,    # (M,) int32
+    triangles: np.ndarray,  # (N, 9) float64
+    ox: float, oy: float, oz: float,
+    dx: float, dy: float, dz: float,
+    max_dist: float,
+) -> bool:
+    """Iterative BVH traversal using explicit stack. Returns True if any hit."""
+    stack = np.empty(64, dtype=np.int32)  # 64 levels is enough for billions of triangles
+    stack_top = 0
+    stack[0] = 0  # root node
+    stack_top = 1
+
+    while stack_top > 0:
+        stack_top -= 1
+        nid = stack[stack_top]
+
+        n = nodes[nid]
+        if not _aabb_intersects_ray(n[0], n[1], n[2], n[3], n[4], n[5],
+                                     ox, oy, oz, dx, dy, dz):
+            continue
+
+        t = tri_idx[nid]
+        if t >= 0:
+            # Leaf node
+            tri = triangles[t]
+            if _ray_tri_intersect(ox, oy, oz, dx, dy, dz,
+                                  tri[0], tri[1], tri[2],
+                                  tri[3], tri[4], tri[5],
+                                  tri[6], tri[7], tri[8],
+                                  max_dist):
+                return True
+        else:
+            # Internal node - push children
+            left = children[nid, 0]
+            right = children[nid, 1]
+            if left >= 0:
+                stack[stack_top] = left
+                stack_top += 1
+            if right >= 0:
+                stack[stack_top] = right
+                stack_top += 1
+
+    return False
+
+
+def is_visible_flat(
+    nodes: np.ndarray,
+    children: np.ndarray,
+    tri_idx: np.ndarray,
+    triangles: np.ndarray,
+    start: np.ndarray,
+    end: np.ndarray,
+) -> bool:
+    """Check visibility using the flat BVH. Pure-numpy/numba path.
+
+    Args:
+        nodes, children, tri_idx: from build_flat_bvh()
+        triangles: (N, 9) float64 array from read_tri_flat()
+        start: (3,) float64 array
+        end: (3,) float64 array
+
+    Returns:
+        True if line of sight is clear, False if blocked.
+    """
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    dz = end[2] - start[2]
+    dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+    if dist < 1e-6:
+        return True
+    dx /= dist
+    dy /= dist
+    dz /= dist
+    return not _traverse_flat_bvh(
+        nodes, children, tri_idx, triangles,
+        start[0], start[1], start[2],
+        dx, dy, dz, dist,
+    )
+
+
+_BVH_MAGIC = b"AWBVH001"  # 8-byte magic for format versioning
+
+
+def save_flat_bvh(
+    path: str | pathlib.Path,
+    nodes: np.ndarray,
+    children: np.ndarray,
+    tri_idx: np.ndarray,
+) -> None:
+    """Save a flat BVH to a binary file.
+
+    Format: magic (8B) | node_count (4B) | nodes (M*48B) | children (M*8B) | tri_idx (M*4B)
+    """
+    path = pathlib.Path(path)
+    m = len(nodes)
+    with open(path, "wb") as f:
+        f.write(_BVH_MAGIC)
+        f.write(struct.pack("<I", m))
+        f.write(nodes.astype(np.float64).tobytes())
+        f.write(children.astype(np.int32).tobytes())
+        f.write(tri_idx.astype(np.int32).tobytes())
+
+
+def load_flat_bvh(path: str | pathlib.Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load a flat BVH from a binary file.
+
+    Returns:
+        nodes: (M, 6) float64
+        children: (M, 2) int32
+        tri_idx: (M,) int32
+    """
+    path = pathlib.Path(path)
+    with open(path, "rb") as f:
+        magic = f.read(8)
+        if magic != _BVH_MAGIC:
+            raise ValueError(f"Invalid BVH file: bad magic {magic!r}")
+        m = struct.unpack("<I", f.read(4))[0]
+        nodes = np.frombuffer(f.read(m * 6 * 8), dtype=np.float64).reshape(m, 6).copy()
+        children = np.frombuffer(f.read(m * 2 * 4), dtype=np.int32).reshape(m, 2).copy()
+        tri_idx = np.frombuffer(f.read(m * 4), dtype=np.int32).copy()
+    return nodes, children, tri_idx
+
+
+@numba.njit(cache=True, parallel=True)
+def _is_visible_batch_kernel(
+    nodes: np.ndarray,
+    children: np.ndarray,
+    tri_idx_arr: np.ndarray,
+    triangles: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    results: np.ndarray,
+) -> None:
+    """Check visibility for a batch of ray pairs in parallel."""
+    n = len(starts)
+    for i in numba.prange(n):
+        sx, sy, sz = starts[i, 0], starts[i, 1], starts[i, 2]
+        ex, ey, ez = ends[i, 0], ends[i, 1], ends[i, 2]
+        dx = ex - sx
+        dy = ey - sy
+        dz = ez - sz
+        dist = (dx * dx + dy * dy + dz * dz) ** 0.5
+        if dist < 1e-6:
+            results[i] = True
+            continue
+        dx /= dist
+        dy /= dist
+        dz /= dist
+        results[i] = not _traverse_flat_bvh(
+            nodes, children, tri_idx_arr, triangles,
+            sx, sy, sz, dx, dy, dz, dist,
+        )
+
+
 class VisibilityChecker:
     """Class for visibility checking in 3D space using a BVH structure."""
 
@@ -663,10 +893,55 @@ class VisibilityChecker:
             triangles (list[Triangle] | None, optional): List of triangles to
                 build the BVH from.
         """
+        self._path = path
+        self._triangles_list = triangles
+        self._root: BVHNode | None = None
+
         if path is not None:
-            triangles = self.read_tri_file(path)
-        self.n_triangles = len(triangles)
-        self.root = self._build_bvh(triangles)
+            self._tri_flat = read_tri_flat(path)
+            self.n_triangles = len(self._tri_flat)
+
+            bvh_path = pathlib.Path(path).with_suffix(".bvh")
+            tri_mtime = pathlib.Path(path).stat().st_mtime
+
+            if bvh_path.exists() and bvh_path.stat().st_mtime >= tri_mtime:
+                logger.debug(f"Loading cached BVH from {bvh_path}")
+                self._bvh_nodes, self._bvh_children, self._bvh_tri_idx = load_flat_bvh(bvh_path)
+            else:
+                logger.debug(f"Building BVH for {path} ({self.n_triangles} triangles)")
+                self._bvh_nodes, self._bvh_children, self._bvh_tri_idx = build_flat_bvh(self._tri_flat)
+                try:
+                    save_flat_bvh(bvh_path, self._bvh_nodes, self._bvh_children, self._bvh_tri_idx)
+                    logger.debug(f"Cached BVH to {bvh_path}")
+                except OSError:
+                    logger.warning(f"Could not cache BVH to {bvh_path}")
+
+        elif triangles is not None:
+            self._tri_flat = np.array(
+                [[t.p1.x, t.p1.y, t.p1.z, t.p2.x, t.p2.y, t.p2.z, t.p3.x, t.p3.y, t.p3.z] for t in triangles],
+                dtype=np.float64,
+            )
+            self.n_triangles = len(self._tri_flat)
+            self._bvh_nodes, self._bvh_children, self._bvh_tri_idx = build_flat_bvh(self._tri_flat)
+        else:
+            raise ValueError("Either path or triangles must be provided")
+
+    @property
+    def root(self) -> BVHNode:
+        """Legacy BVH tree root. Built on first access."""
+        if self._root is None:
+            if self._path is not None:
+                triangles = self.read_tri_file(self._path)
+            elif self._triangles_list is not None:
+                triangles = self._triangles_list
+            else:
+                raise RuntimeError("Cannot build legacy BVH: no source data")
+            self._root = self._build_bvh(triangles)
+        return self._root
+
+    @root.setter
+    def root(self, value: BVHNode | None) -> None:
+        self._root = value
 
     def __repr__(self) -> str:
         """Return a string representation of the VisibilityChecker."""
@@ -829,17 +1104,36 @@ class VisibilityChecker:
         start_vec = awpy.vector.Vector3.from_input(start)
         end_vec = awpy.vector.Vector3.from_input(end)
 
-        # Calculate ray direction and length
-        direction = end_vec - start_vec
-        distance = direction.length()
+        start_arr = np.array([start_vec.x, start_vec.y, start_vec.z], dtype=np.float64)
+        end_arr = np.array([end_vec.x, end_vec.y, end_vec.z], dtype=np.float64)
 
-        if distance < 1e-6:
-            return True
+        return is_visible_flat(
+            self._bvh_nodes, self._bvh_children, self._bvh_tri_idx,
+            self._tri_flat, start_arr, end_arr,
+        )
 
-        direction = direction.normalize()
+    def is_visible_batch(
+        self,
+        starts: np.ndarray,
+        ends: np.ndarray,
+    ) -> np.ndarray:
+        """Check visibility for a batch of point pairs.
 
-        # Check for intersections
-        return not self._traverse_bvh(self.root, start_vec, direction, distance)
+        Args:
+            starts: (N, 3) float64 array of start points.
+            ends: (N, 3) float64 array of end points.
+
+        Returns:
+            (N,) boolean array. True = visible, False = blocked.
+        """
+        starts = np.ascontiguousarray(starts, dtype=np.float64)
+        ends = np.ascontiguousarray(ends, dtype=np.float64)
+        results = np.empty(len(starts), dtype=np.bool_)
+        _is_visible_batch_kernel(
+            self._bvh_nodes, self._bvh_children, self._bvh_tri_idx,
+            self._tri_flat, starts, ends, results,
+        )
+        return results
 
     @staticmethod
     def read_tri_file(tri_file: str | pathlib.Path, buffer_size: int = 1000) -> list[Triangle]:

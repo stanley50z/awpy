@@ -175,3 +175,146 @@ class TestFlatBVHBuild:
         internal_mask = tri_idx < 0
         assert np.all(children[internal_mask, 0] >= 0)
         assert np.all(children[internal_mask, 1] >= 0)
+
+
+class TestNumbaTraversal:
+    """Test numba-JIT'd ray traversal matches original."""
+
+    @pytest.fixture(autouse=True)
+    def setup_runner(self):
+        self.runner = CliRunner()
+        self.runner.invoke(awpy.cli.get, ["usd", "de_dust2"])
+
+    def test_numba_matches_original_visibility(self):
+        """Numba traversal produces identical results to original BVH."""
+        tri_path = awpy.data.TRIS_DIR / "de_dust2.tri"
+
+        # Original checker
+        vc_original = awpy.visibility.VisibilityChecker(path=tri_path)
+
+        # Flat BVH checker
+        tris_flat = awpy.visibility.read_tri_flat(tri_path)
+        nodes, children, tri_idx = awpy.visibility.build_flat_bvh(tris_flat)
+
+        test_pairs = [
+            ((-651, -831, 179), (-992, -766, 181), True),
+            ((-651, -831, 179), (15, 2168, -65), False),
+            ((-485.90, 1737.51, -60.28), (-489.97, 1532.02, -61.08), False),
+            ((-515.23, 2251.36, -55.76), (1318.11, 2027.95, 62.41), True),
+            ((195.87, 2467.87, -52.50), (-860.00, -733.00, 190.00), False),
+        ]
+
+        for start, end, expected in test_pairs:
+            original_result = vc_original.is_visible(start, end)
+            assert original_result == expected, f"Original failed for {start}->{end}"
+
+            numba_result = awpy.visibility.is_visible_flat(
+                nodes, children, tri_idx, tris_flat,
+                np.array(start, dtype=np.float64),
+                np.array(end, dtype=np.float64),
+            )
+            assert numba_result == expected, f"Numba failed for {start}->{end}"
+
+    def test_numba_symmetry(self):
+        """Visibility is symmetric (A->B == B->A)."""
+        tri_path = awpy.data.TRIS_DIR / "de_dust2.tri"
+        tris_flat = awpy.visibility.read_tri_flat(tri_path)
+        nodes, children, tri_idx = awpy.visibility.build_flat_bvh(tris_flat)
+
+        pairs = [
+            ((-651, -831, 179), (-992, -766, 181)),
+            ((-651, -831, 179), (15, 2168, -65)),
+            ((-485.90, 1737.51, -60.28), (-489.97, 1532.02, -61.08)),
+        ]
+
+        for start, end in pairs:
+            fwd = awpy.visibility.is_visible_flat(
+                nodes, children, tri_idx, tris_flat,
+                np.array(start, dtype=np.float64),
+                np.array(end, dtype=np.float64),
+            )
+            rev = awpy.visibility.is_visible_flat(
+                nodes, children, tri_idx, tris_flat,
+                np.array(end, dtype=np.float64),
+                np.array(start, dtype=np.float64),
+            )
+            assert fwd == rev, f"Asymmetric for {start}<->{end}"
+
+
+class TestBVHCache:
+    """Test BVH save/load cycle."""
+
+    @pytest.fixture(autouse=True)
+    def setup_runner(self):
+        self.runner = CliRunner()
+        self.runner.invoke(awpy.cli.get, ["usd", "de_dust2"])
+
+    def test_save_load_roundtrip(self, tmp_path):
+        """Saved BVH loads back identically."""
+        tri_path = awpy.data.TRIS_DIR / "de_dust2.tri"
+        tris = awpy.visibility.read_tri_flat(tri_path)
+        nodes, children, tri_idx = awpy.visibility.build_flat_bvh(tris)
+
+        bvh_path = tmp_path / "de_dust2.bvh"
+        awpy.visibility.save_flat_bvh(bvh_path, nodes, children, tri_idx)
+
+        nodes2, children2, tri_idx2 = awpy.visibility.load_flat_bvh(bvh_path)
+
+        np.testing.assert_array_equal(nodes, nodes2)
+        np.testing.assert_array_equal(children, children2)
+        np.testing.assert_array_equal(tri_idx, tri_idx2)
+
+    def test_cached_checker_matches_fresh(self, tmp_path):
+        """VisibilityChecker with cached BVH produces same results."""
+        import shutil
+        tri_path = awpy.data.TRIS_DIR / "de_dust2.tri"
+
+        tmp_tri = tmp_path / "de_dust2.tri"
+        shutil.copy(tri_path, tmp_tri)
+
+        # First load: builds BVH and caches it
+        vc1 = awpy.visibility.VisibilityChecker(path=tmp_tri)
+        bvh_file = tmp_tri.with_suffix(".bvh")
+        assert bvh_file.exists(), "BVH cache file was not created"
+
+        # Second load: should use cache
+        vc2 = awpy.visibility.VisibilityChecker(path=tmp_tri)
+
+        test_points = [
+            ((-651, -831, 179), (-992, -766, 181)),
+            ((-651, -831, 179), (15, 2168, -65)),
+        ]
+        for start, end in test_points:
+            assert vc1.is_visible(start, end) == vc2.is_visible(start, end)
+
+
+class TestBatchVisibility:
+    """Test batch visibility checking."""
+
+    @pytest.fixture(autouse=True)
+    def setup_runner(self):
+        self.runner = CliRunner()
+        self.runner.invoke(awpy.cli.get, ["usd", "de_dust2"])
+
+    def test_batch_matches_individual(self):
+        """Batch results match individual is_visible calls."""
+        tri_path = awpy.data.TRIS_DIR / "de_dust2.tri"
+        vc = awpy.visibility.VisibilityChecker(path=tri_path)
+
+        starts = np.array([
+            [-651, -831, 179],
+            [-651, -831, 179],
+            [-485.90, 1737.51, -60.28],
+            [-515.23, 2251.36, -55.76],
+        ], dtype=np.float64)
+        ends = np.array([
+            [-992, -766, 181],
+            [15, 2168, -65],
+            [-489.97, 1532.02, -61.08],
+            [1318.11, 2027.95, 62.41],
+        ], dtype=np.float64)
+
+        batch_results = vc.is_visible_batch(starts, ends)
+        individual_results = [vc.is_visible(tuple(s), tuple(e)) for s, e in zip(starts, ends)]
+
+        np.testing.assert_array_equal(batch_results, individual_results)
