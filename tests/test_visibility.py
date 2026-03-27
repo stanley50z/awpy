@@ -132,3 +132,46 @@ class TestFlatTriReader:
             [t_last.p1.x, t_last.p1.y, t_last.p1.z, t_last.p2.x, t_last.p2.y, t_last.p2.z, t_last.p3.x, t_last.p3.y, t_last.p3.z],
             atol=1e-5,
         )
+
+
+class TestFlatBVHBuild:
+    """Test flat BVH construction."""
+
+    def test_build_small_bvh(self):
+        """Build a BVH from a small set of triangles and verify structure."""
+        tris = np.array([
+            [0,0,0, 1,0,0, 0,1,0],
+            [5,5,5, 6,5,5, 5,6,5],
+            [2,2,2, 3,2,2, 2,3,2],
+        ], dtype=np.float64)
+
+        nodes, children, tri_idx = awpy.visibility.build_flat_bvh(tris)
+
+        assert nodes.shape[1] == 6
+        assert children.shape[1] == 2
+        assert len(tri_idx) == len(nodes)
+
+        root_min = nodes[0, :3]
+        root_max = nodes[0, 3:]
+        assert root_min[0] <= 0.0
+        assert root_max[0] >= 6.0
+
+        leaf_count = np.sum(tri_idx >= 0)
+        assert leaf_count == 3
+
+    @pytest.fixture(autouse=True)
+    def setup_runner(self):
+        self.runner = CliRunner()
+        self.runner.invoke(awpy.cli.get, ["usd", "de_dust2"])
+
+    def test_build_dust2_bvh(self):
+        """Build BVH for de_dust2 and verify basic properties."""
+        tris = awpy.visibility.read_tri_flat(awpy.data.TRIS_DIR / "de_dust2.tri")
+        nodes, children, tri_idx = awpy.visibility.build_flat_bvh(tris)
+
+        leaf_count = int(np.sum(tri_idx >= 0))
+        assert leaf_count == len(tris)
+
+        internal_mask = tri_idx < 0
+        assert np.all(children[internal_mask, 0] >= 0)
+        assert np.all(children[internal_mask, 1] >= 0)

@@ -575,6 +575,82 @@ def read_tri_flat(tri_file: str | pathlib.Path) -> np.ndarray:
     return raw[: n_triangles * 9].reshape(n_triangles, 9).astype(np.float64)
 
 
+def build_flat_bvh(triangles: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build a flattened BVH from an (N, 9) triangle array.
+
+    Returns:
+        nodes: float64 (M, 6) - AABB [min_x, min_y, min_z, max_x, max_y, max_z]
+        children: int32 (M, 2) - [left, right] child indices (-1 for leaves)
+        tri_idx: int32 (M,) - triangle index for leaves (-1 for internal)
+    """
+    n = len(triangles)
+
+    centroids = (
+        triangles[:, 0:3] + triangles[:, 3:6] + triangles[:, 6:9]
+    ) / 3.0
+
+    p1 = triangles[:, 0:3]
+    p2 = triangles[:, 3:6]
+    p3 = triangles[:, 6:9]
+    tri_mins = np.minimum(np.minimum(p1, p2), p3)
+    tri_maxs = np.maximum(np.maximum(p1, p2), p3)
+
+    max_nodes = 2 * n - 1
+    nodes = np.empty((max_nodes, 6), dtype=np.float64)
+    children = np.full((max_nodes, 2), -1, dtype=np.int32)
+    tri_idx = np.full(max_nodes, -1, dtype=np.int32)
+    node_count = 0
+
+    indices = np.arange(n, dtype=np.int32)
+
+    root_idx = 0
+    node_count = 1
+
+    stack: list[tuple[int, np.ndarray]] = [(root_idx, indices)]
+
+    while stack:
+        nid, idx = stack.pop()
+
+        if len(idx) == 1:
+            i = idx[0]
+            nodes[nid, :3] = tri_mins[i]
+            nodes[nid, 3:] = tri_maxs[i]
+            tri_idx[nid] = i
+            continue
+
+        subset_mins = tri_mins[idx]
+        subset_maxs = tri_maxs[idx]
+        aabb_min = subset_mins.min(axis=0)
+        aabb_max = subset_maxs.max(axis=0)
+        nodes[nid, :3] = aabb_min
+        nodes[nid, 3:] = aabb_max
+
+        c = centroids[idx]
+        spreads = c.max(axis=0) - c.min(axis=0)
+        axis = int(np.argmax(spreads))
+
+        mid = len(idx) // 2
+        order = np.argpartition(c[:, axis], mid)
+        left_idx = idx[order[:mid]]
+        right_idx = idx[order[mid:]]
+
+        left_nid = node_count
+        right_nid = node_count + 1
+        node_count += 2
+
+        children[nid, 0] = left_nid
+        children[nid, 1] = right_nid
+
+        stack.append((left_nid, left_idx))
+        stack.append((right_nid, right_idx))
+
+    nodes = nodes[:node_count]
+    children = children[:node_count]
+    tri_idx = tri_idx[:node_count]
+
+    return nodes, children, tri_idx
+
+
 class VisibilityChecker:
     """Class for visibility checking in 3D space using a BVH structure."""
 
