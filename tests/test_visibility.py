@@ -1,5 +1,6 @@
 """Test the visibility module."""
 
+import numpy as np
 import pytest
 from click.testing import CliRunner
 
@@ -99,3 +100,35 @@ class TestVisibility:
             assert brute_force_result == brute_force_result_reverse, (
                 f"Brute force visibility not symmetric for {start} and {end}"
             )
+
+
+class TestFlatTriReader:
+    """Test the flat numpy triangle reader."""
+
+    @pytest.fixture(autouse=True)
+    def setup_runner(self):
+        self.runner = CliRunner()
+        self.runner.invoke(awpy.cli.get, ["usd", "de_dust2"])
+
+    def test_flat_reader_matches_object_reader(self):
+        """Flat reader produces same data as object-based reader."""
+        tri_path = awpy.data.TRIS_DIR / "de_dust2.tri"
+        tris_objects = awpy.visibility.VisibilityChecker.read_tri_file(tri_path)
+        tris_flat = awpy.visibility.read_tri_flat(tri_path)
+
+        assert tris_flat.shape == (len(tris_objects), 9)
+        assert tris_flat.dtype == np.float64
+
+        # Spot-check first and last triangle
+        t0 = tris_objects[0]
+        np.testing.assert_allclose(
+            tris_flat[0],
+            [t0.p1.x, t0.p1.y, t0.p1.z, t0.p2.x, t0.p2.y, t0.p2.z, t0.p3.x, t0.p3.y, t0.p3.z],
+            atol=1e-5,
+        )
+        t_last = tris_objects[-1]
+        np.testing.assert_allclose(
+            tris_flat[-1],
+            [t_last.p1.x, t_last.p1.y, t_last.p1.z, t_last.p2.x, t_last.p2.y, t_last.p2.z, t_last.p3.x, t_last.p3.y, t_last.p3.z],
+            atol=1e-5,
+        )

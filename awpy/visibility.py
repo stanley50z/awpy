@@ -10,6 +10,7 @@ import struct
 from dataclasses import dataclass
 from typing import Literal, overload
 
+import numpy as np
 from loguru import logger
 
 import awpy.vector
@@ -561,6 +562,17 @@ class BVHNode:
         self.triangle = triangle
         self.left = left
         self.right = right
+
+
+def read_tri_flat(tri_file: str | pathlib.Path) -> np.ndarray:
+    """Read a .tri file into a flat (N, 9) float64 numpy array.
+
+    Each row is [p1x, p1y, p1z, p2x, p2y, p2z, p3x, p3y, p3z].
+    """
+    tri_file = pathlib.Path(tri_file)
+    raw = np.fromfile(tri_file, dtype=np.float32)
+    n_triangles = len(raw) // 9
+    return raw[: n_triangles * 9].reshape(n_triangles, 9).astype(np.float64)
 
 
 class VisibilityChecker:
